@@ -10,8 +10,7 @@ PIN_LED_GREEN = 22
 PIN_BUZZER = 23
 PIN_BTN_POWER = 5    # tact switch 1: ON/OFF toggle + triggers recalibration on ON
 PIN_BTN_DISMISS = 6  # tact switch 2: dismiss/silence current alert
-PIN_FSR1 = 26         # force-sensitive resistor 1 (voltage divider -> digital HIGH/LOW)
-PIN_FSR2 = 19         # force-sensitive resistor 2 (voltage divider -> digital HIGH/LOW)
+PIN_FSR = 26          # combined FSR1+FSR2 (wired in parallel -> single voltage divider)
 
 # ===== Double-tap settings =====
 DOUBLE_TAP_WINDOW = 0.5  # seconds: two presses (either FSR) within this window = double tap
@@ -43,10 +42,10 @@ class AlertSystem:
         self.btn_power = Button(PIN_BTN_POWER, pull_up=True, bounce_time=0.05)
         self.btn_dismiss = Button(PIN_BTN_DISMISS, pull_up=True, bounce_time=0.05)
 
-        # FSR pads wired as voltage dividers -> digital HIGH when pressed.
-        # pull_up=False because the divider circuit (not an internal pull-up) sets the idle level.
-        self.fsr1 = Button(PIN_FSR1, pull_up=False, bounce_time=0.05)
-        self.fsr2 = Button(PIN_FSR2, pull_up=False, bounce_time=0.05)
+        # FSR1 and FSR2 are wired in parallel into one voltage divider, so they appear
+        # to gpiozero as a single button: pressed (HIGH) if either pad is pressed,
+        # released (LOW) only once both pads are released.
+        self.fsr = Button(PIN_FSR, pull_up=False, bounce_time=0.05)
 
         self.system_on = False
         self.needs_recalibration = True  # requires calibration before first use
@@ -70,10 +69,9 @@ class AlertSystem:
         # Wire up button callbacks (gpiozero calls these automatically on press)
         self.btn_power.when_pressed = self._on_power_button_pressed
         self.btn_dismiss.when_pressed = self._on_dismiss_button_pressed
-        # Use when_released (not when_pressed) so a tap only counts once the finger
-        # is fully lifted -- holding the FSR down must NOT keep re-triggering.
-        self.fsr1.when_released = self._on_fsr_released
-        self.fsr2.when_released = self._on_fsr_released
+        # Use when_released (not when_pressed) so a tap only counts once both FSR pads
+        # are fully released -- holding either FSR down must NOT keep re-triggering.
+        self.fsr.when_released = self._on_fsr_released
 
         # ----- BLE serial connection to master HM-10 (bridges to Pro Mini for vibration) -----
         self.ble_serial = None
@@ -316,8 +314,7 @@ class AlertSystem:
         self.buzzer.close()
         self.btn_power.close()
         self.btn_dismiss.close()
-        self.fsr1.close()
-        self.fsr2.close()
+        self.fsr.close()
         if self.ble_serial is not None:
             self.ble_serial.close()
 
