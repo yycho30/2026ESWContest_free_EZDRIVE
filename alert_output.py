@@ -10,6 +10,11 @@ PIN_LED_GREEN = 22
 PIN_BUZZER = 23
 PIN_BTN_POWER = 5    # tact switch 1: ON/OFF toggle + triggers recalibration on ON
 PIN_BTN_DISMISS = 6  # tact switch 2: dismiss/silence current alert
+PIN_FSR1 = 26         # force-sensitive resistor 1 (voltage divider -> digital HIGH/LOW)
+PIN_FSR2 = 19         # force-sensitive resistor 2 (voltage divider -> digital HIGH/LOW)
+
+# ===== Double-tap settings =====
+DOUBLE_TAP_WINDOW = 0.5  # seconds: two presses (either FSR) within this window = double tap
 
 # ===== Buzzer pattern settings (seconds) =====
 # Each pattern is (on_time, off_time). "None" off_time means continuous ON.
@@ -38,6 +43,11 @@ class AlertSystem:
         self.btn_power = Button(PIN_BTN_POWER, pull_up=True, bounce_time=0.05)
         self.btn_dismiss = Button(PIN_BTN_DISMISS, pull_up=True, bounce_time=0.05)
 
+        # FSR pads wired as voltage dividers -> digital HIGH when pressed.
+        # pull_up=False because the divider circuit (not an internal pull-up) sets the idle level.
+        self.fsr1 = Button(PIN_FSR1, pull_up=False, bounce_time=0.05)
+        self.fsr2 = Button(PIN_FSR2, pull_up=False, bounce_time=0.05)
+
         self.system_on = False
         self.needs_recalibration = True  # requires calibration before first use
         self.is_calibrating = False
@@ -54,9 +64,14 @@ class AlertSystem:
         self._red_blink_thread = None
         self._red_blink_stop_flag = threading.Event()
 
+        # ----- Double-tap detection state (either FSR counts toward the same tap sequence) -----
+        self._last_tap_time = 0.0
+
         # Wire up button callbacks (gpiozero calls these automatically on press)
         self.btn_power.when_pressed = self._on_power_button_pressed
         self.btn_dismiss.when_pressed = self._on_dismiss_button_pressed
+        self.fsr1.when_pressed = self._on_fsr_pressed
+        self.fsr2.when_pressed = self._on_fsr_pressed
 
         # ----- BLE serial connection to master HM-10 (bridges to Pro Mini for vibration) -----
         self.ble_serial = None
@@ -95,6 +110,27 @@ class AlertSystem:
             self._stop_buzzer()
             self.led_red.off()
             self._send_vibration_command(0)  # tell Pro Mini to stop vibrating immediately
+
+    # ---------- FSR double-tap handling ----------
+    def _on_fsr_pressed(self):
+        if not self.system_on:
+            return
+
+        now = time.time()
+        if now - self._last_tap_time <= DOUBLE_TAP_WINDOW:
+            # Second tap arrived within the window -> double tap detected
+            print("Double tap detected. Resetting to state 0 (normal).")
+            self._last_tap_time = 0.0  # reset so a third quick press doesn't chain-trigger
+            self._reset_to_normal()
+        else:
+            # First tap of a possible pair -> just record the time and wait
+            self._last_tap_time = now
+
+    def _reset_to_normal(self):
+        """Force the alert state back to 0 (normal), as if a fresh 'normal' reading came in."""
+        with self._lock:
+            self.alert_dismissed = False  # clear any prior dismissal so state 0 renders cleanly
+        self.update_output(state=0, ir_reliable=True)
 
     # ---------- Calibration ----------
     def _start_calibration(self):
@@ -273,6 +309,8 @@ class AlertSystem:
         self.buzzer.close()
         self.btn_power.close()
         self.btn_dismiss.close()
+        self.fsr1.close()
+        self.fsr2.close()
         if self.ble_serial is not None:
             self.ble_serial.close()
 
