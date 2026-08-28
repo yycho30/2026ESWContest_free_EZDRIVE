@@ -113,11 +113,14 @@ class AlertSystem:
 
     # ---------- FSR double-tap handling ----------
     def _on_fsr_pressed(self):
+        print(f"[DEBUG] FSR callback fired. system_on={self.system_on}")
         if not self.system_on:
             return
 
         now = time.time()
-        if now - self._last_tap_time <= DOUBLE_TAP_WINDOW:
+        gap = now - self._last_tap_time
+        print(f"[DEBUG] Gap since last tap: {gap:.3f}s (window={DOUBLE_TAP_WINDOW}s)")
+        if gap <= DOUBLE_TAP_WINDOW:
             # Second tap arrived within the window -> double tap detected
             print("Double tap detected. Resetting to state 0 (normal).")
             self._last_tap_time = 0.0  # reset so a third quick press doesn't chain-trigger
