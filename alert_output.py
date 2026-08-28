@@ -70,8 +70,10 @@ class AlertSystem:
         # Wire up button callbacks (gpiozero calls these automatically on press)
         self.btn_power.when_pressed = self._on_power_button_pressed
         self.btn_dismiss.when_pressed = self._on_dismiss_button_pressed
-        self.fsr1.when_pressed = self._on_fsr_pressed
-        self.fsr2.when_pressed = self._on_fsr_pressed
+        # Use when_released (not when_pressed) so a tap only counts once the finger
+        # is fully lifted -- holding the FSR down must NOT keep re-triggering.
+        self.fsr1.when_released = self._on_fsr_released
+        self.fsr2.when_released = self._on_fsr_released
 
         # ----- BLE serial connection to master HM-10 (bridges to Pro Mini for vibration) -----
         self.ble_serial = None
@@ -112,21 +114,23 @@ class AlertSystem:
             self._send_vibration_command(0)  # tell Pro Mini to stop vibrating immediately
 
     # ---------- FSR double-tap handling ----------
-    def _on_fsr_pressed(self):
-        print(f"[DEBUG] FSR callback fired. system_on={self.system_on}")
+    def _on_fsr_released(self):
+        # This fires only when a finger that was pressing an FSR fully lifts off.
+        # A full press+release cycle = one confirmed tap.
+        print(f"[DEBUG] FSR released (tap confirmed). system_on={self.system_on}")
         if not self.system_on:
             return
 
         now = time.time()
         gap = now - self._last_tap_time
-        print(f"[DEBUG] Gap since last tap: {gap:.3f}s (window={DOUBLE_TAP_WINDOW}s)")
-        if gap <= DOUBLE_TAP_WINDOW:
-            # Second tap arrived within the window -> double tap detected
+        print(f"[DEBUG] Gap since last confirmed tap: {gap:.3f}s (window={DOUBLE_TAP_WINDOW}s)")
+        if self._last_tap_time > 0 and gap <= DOUBLE_TAP_WINDOW:
+            # Second confirmed tap arrived within the window -> double tap detected
             print("Double tap detected. Resetting to state 0 (normal).")
-            self._last_tap_time = 0.0  # reset so a third quick press doesn't chain-trigger
+            self._last_tap_time = 0.0  # reset so a third quick tap doesn't chain-trigger
             self._reset_to_normal()
         else:
-            # First tap of a possible pair -> just record the time and wait
+            # First confirmed tap of a possible pair -> record the time and wait
             self._last_tap_time = now
 
     def _reset_to_normal(self):
