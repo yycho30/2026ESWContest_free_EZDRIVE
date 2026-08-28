@@ -10,10 +10,12 @@ PIN_LED_GREEN = 22
 PIN_BUZZER = 23
 PIN_BTN_POWER = 5    # tact switch 1: ON/OFF toggle + triggers recalibration on ON
 PIN_BTN_DISMISS = 6  # tact switch 2: dismiss/silence current alert
-PIN_FSR = 26          # combined FSR1+FSR2 (wired in parallel -> single voltage divider)
+PIN_FSR1 = 26         # force-sensitive resistor 1 (voltage divider -> digital HIGH/LOW)
+PIN_FSR2 = 19         # force-sensitive resistor 2 (voltage divider -> digital HIGH/LOW)
 
 # ===== Double-tap settings =====
-DOUBLE_TAP_WINDOW = 0.5  # seconds: two presses (either FSR) within this window = double tap
+DOUBLE_TAP_WINDOW = 0.5   # seconds: two confirmed taps within this window = double tap
+SIMULTANEOUS_RELEASE_GRACE = 0.15  # seconds: releases from FSR1/FSR2 within this gap count as ONE tap
 
 # ===== Buzzer pattern settings (seconds) =====
 # Each pattern is (on_time, off_time). "None" off_time means continuous ON.
@@ -42,10 +44,9 @@ class AlertSystem:
         self.btn_power = Button(PIN_BTN_POWER, pull_up=True, bounce_time=0.05)
         self.btn_dismiss = Button(PIN_BTN_DISMISS, pull_up=True, bounce_time=0.05)
 
-        # FSR1 and FSR2 are wired in parallel into one voltage divider, so they appear
-        # to gpiozero as a single button: pressed (HIGH) if either pad is pressed,
-        # released (LOW) only once both pads are released.
-        self.fsr = Button(PIN_FSR, pull_up=False, bounce_time=0.05)
+        # FSR pads wired as individual voltage dividers -> digital HIGH when pressed.
+        self.fsr1 = Button(PIN_FSR1, pull_up=False, bounce_time=0.05)
+        self.fsr2 = Button(PIN_FSR2, pull_up=False, bounce_time=0.05)
 
         self.system_on = False
         self.needs_recalibration = True  # requires calibration before first use
@@ -63,15 +64,24 @@ class AlertSystem:
         self._red_blink_thread = None
         self._red_blink_stop_flag = threading.Event()
 
-        # ----- Double-tap detection state (either FSR counts toward the same tap sequence) -----
+        # ----- Double-tap detection state -----
         self._last_tap_time = 0.0
+
+        # ----- Simultaneous-release grace window state -----
+        # When one FSR releases, we wait a short grace period before counting it as
+        # a confirmed tap. If the *other* FSR also releases within that window
+        # (both hands lifting at slightly different instants), it still counts as
+        # only ONE tap, not two.
+        self._pending_release_timer = None
+        self._release_pending = False
 
         # Wire up button callbacks (gpiozero calls these automatically on press)
         self.btn_power.when_pressed = self._on_power_button_pressed
         self.btn_dismiss.when_pressed = self._on_dismiss_button_pressed
-        # Use when_released (not when_pressed) so a tap only counts once both FSR pads
-        # are fully released -- holding either FSR down must NOT keep re-triggering.
-        self.fsr.when_released = self._on_fsr_released
+        # Use when_released (not when_pressed) so a tap only counts once the finger
+        # is fully lifted -- holding an FSR down must NOT keep re-triggering.
+        self.fsr1.when_released = self._on_fsr_released
+        self.fsr2.when_released = self._on_fsr_released
 
         # ----- BLE serial connection to master HM-10 (bridges to Pro Mini for vibration) -----
         self.ble_serial = None
@@ -113,15 +123,33 @@ class AlertSystem:
 
     # ---------- FSR double-tap handling ----------
     def _on_fsr_released(self):
-        # This fires only when a finger that was pressing an FSR fully lifts off.
-        # A full press+release cycle = one confirmed tap.
-        print(f"[DEBUG] FSR released (tap confirmed). system_on={self.system_on}")
+        # Either FSR releasing lands here. Instead of confirming the tap immediately,
+        # start (or restart) a short grace-period timer. If the OTHER FSR also
+        # releases before that timer fires, we just let the existing timer run --
+        # so two near-simultaneous releases still resolve to a single confirmed tap.
+        print(f"[DEBUG] FSR released (raw event). system_on={self.system_on}")
         if not self.system_on:
             return
 
+        if self._release_pending:
+            # A release is already being debounced -- this is the "other hand"
+            # lifting off within the grace window. Don't start a second timer.
+            print("[DEBUG] Second near-simultaneous release absorbed into the same tap.")
+            return
+
+        self._release_pending = True
+        self._pending_release_timer = threading.Timer(
+            SIMULTANEOUS_RELEASE_GRACE, self._confirm_tap
+        )
+        self._pending_release_timer.start()
+
+    def _confirm_tap(self):
+        """Called once the grace window has passed with no further FSR release -- this is one confirmed tap."""
+        self._release_pending = False
+
         now = time.time()
         gap = now - self._last_tap_time
-        print(f"[DEBUG] Gap since last confirmed tap: {gap:.3f}s (window={DOUBLE_TAP_WINDOW}s)")
+        print(f"[DEBUG] Tap confirmed. Gap since last confirmed tap: {gap:.3f}s (window={DOUBLE_TAP_WINDOW}s)")
         if self._last_tap_time > 0 and gap <= DOUBLE_TAP_WINDOW:
             # Second confirmed tap arrived within the window -> double tap detected
             print("Double tap detected. Resetting to state 0 (normal).")
@@ -308,13 +336,16 @@ class AlertSystem:
 
     def cleanup(self):
         self._stop_all_outputs()
+        if self._pending_release_timer is not None:
+            self._pending_release_timer.cancel()
         self.led_red.close()
         self.led_yellow.close()
         self.led_green.close()
         self.buzzer.close()
         self.btn_power.close()
         self.btn_dismiss.close()
-        self.fsr.close()
+        self.fsr1.close()
+        self.fsr2.close()
         if self.ble_serial is not None:
             self.ble_serial.close()
 
