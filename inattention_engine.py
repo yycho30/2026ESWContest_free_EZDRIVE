@@ -34,10 +34,10 @@ HEAD_YAW_SIGN = +1.0         # Determined by measurement: +1 if yaw increases wh
 HEAD_YAW_OFFSET_DEG = 0.0    # Frontal reference value obtained from calibration (if available)
 
 # ===== Detection Parameters =====
-PERIPHERAL_ANGLE_DEG = 20.0  # Obstacles appearing outside this angle require turning the head to check
+PERIPHERAL_ANGLE_DEG = 17.0  # Obstacles appearing outside this angle require turning the head to check
 REACTION_TIME_SEC = 2.0      # Inattention if not checked within this time after appearance
 CONFIRM_RATIO = 0.5          # Acknowledged as checked if the head is turned by this ratio of the obstacle angle
-CONFIRM_MIN_DEG = 8.0        # However, the head must be turned by at least this minimum angle
+CONFIRM_MIN_DEG = 20.0        # However, the head must be turned by at least this minimum angle
 
 # ===== Risk Levels (Bounding Box Area Ratio) =====
 # Large objects appear large even from afar, while people only appear large when close -> Different thresholds per class
