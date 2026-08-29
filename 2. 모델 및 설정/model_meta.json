@@ -1,0 +1,29 @@
+{
+  "features": [
+    "ir_norm",
+    "ir_roll_mean",
+    "ir_roll_min",
+    "perclos",
+    "closed_duration_s",
+    "ir_diff_abs",
+    "ir_roll_std",
+    "ir_roll_range",
+    "ir_activity_ratio",
+    "yaw_norm",
+    "pitch_norm",
+    "pitch_roll_mean",
+    "yaw_angular_velocity_deg_s",
+    "pitch_angular_velocity_deg_s",
+    "ang_vel_mag",
+    "ang_roll_std",
+    "is_yawning",
+    "mouth_open_duration_s",
+    "yawn_recent"
+  ],
+  "n_train": 38085,
+  "n_subjects": 10,
+  "classes": {
+    "0": "normal",
+    "1": "danger"
+  }
+}
