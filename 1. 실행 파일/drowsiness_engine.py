@@ -310,6 +310,8 @@ class FeatureBuffer:
 MIN_STATE2_DURATION_FOR_LEARNING = 1.0   # a double tap only teaches the detector
                                           # if state 2 had already held this long -
                                           # a quick flicker + tap habit shouldn't count
+STATE2_STALENESS_SEC = 0.5   # a double tap this long after state 2 last held is
+                              # treated as unrelated, not a dismissal of it
 
 EYES_CLOSED_RELEARN_SEC = 1.5   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
@@ -361,7 +363,11 @@ class DrowsinessDetector:
         self._last_o_cur = None
         self._state2_since = None
         self._state2_duration = 0.0
+        self._state2_last_active = None   # time state 2 was last true, for staleness check
         self._eyes_closed_relearn_last = None    # time of the last adjustment, for the cooldown
+        self._eyes_closed_relief = 0.0   # cumulative downward adjustment from eyes-closed
+                                          # evidence, applied on top of the recomputed floor
+                                          # so it survives _recompute_fp_threshold() every frame
         self.false_positive_probs = []   # list of (prob, o_cur) at dismissal time
         self.fp_threshold = None   # None until the first dismissal
 
@@ -375,9 +381,19 @@ class DrowsinessDetector:
         """
         if self._last_prob is None:
             return
-        if self._state2_duration < MIN_STATE2_DURATION_FOR_LEARNING:
+
+        # register_false_positive() runs on a button-callback thread, so it
+        # can land between two update() calls. _state2_duration is only
+        # refreshed inside update(), so without this check a tap arriving
+        # just after state 2 already ended could still see a stale >1s
+        # value and wrongly count as a real dismissal. Require state 2 to
+        # have been active within the last update cycle.
+        stale = (self._state2_last_active is None or
+                time.time() - self._state2_last_active > STATE2_STALENESS_SEC)
+        if stale or self._state2_duration < MIN_STATE2_DURATION_FOR_LEARNING:
             print(f"[learning] double tap ignored - state 2 only held for "
-                  f"{self._state2_duration:.1f}s (need {MIN_STATE2_DURATION_FOR_LEARNING:.0f}s)")
+                  f"{self._state2_duration:.1f}s (need {MIN_STATE2_DURATION_FOR_LEARNING:.0f}s)"
+                  + (", stale" if stale else ""))
             return
         self.false_positive_probs.append((self._last_prob, self._last_o_cur))
         self._recompute_fp_threshold()
@@ -387,7 +403,11 @@ class DrowsinessDetector:
 
     def _recompute_fp_threshold(self):
         """Rescales every stored false-positive probability to the current
-        o_cur, then floors the threshold just above the lowest of them."""
+        o_cur, floors the threshold just above the lowest of them, then
+        applies the eyes-closed relief accumulated since (see
+        register_false_positive / the eyes-closed check in update()).
+        Without the relief term this recompute would silently undo every
+        eyes-closed adjustment on the very next frame."""
         if not self.false_positive_probs:
             self.fp_threshold = None
             return
@@ -405,7 +425,8 @@ class DrowsinessDetector:
             ratio = float(np.clip(ratio, 0.5, 2.0))   # don't let one odd sample overcorrect
             rescaled.append(float(np.clip(prob * ratio, 0.0, 1.0)))
         floor = min(rescaled)
-        self.fp_threshold = float(np.clip(floor + FALSE_POSITIVE_MARGIN, 0.0, 0.95))
+        base = float(np.clip(floor + FALSE_POSITIVE_MARGIN, 0.0, 0.95))
+        self.fp_threshold = float(np.clip(base - self._eyes_closed_relief, 0.0, 0.95))
 
     def update(self, ir, yaw, pitch, yaw_vel, pitch_vel,
                is_yawning, mouth_open_duration, now=None):
@@ -480,6 +501,7 @@ class DrowsinessDetector:
             if self._state2_since is None:
                 self._state2_since = now
             self._state2_duration = now - self._state2_since
+            self._state2_last_active = now
         else:
             self._state2_since = None
             self._state2_duration = 0.0
@@ -494,9 +516,9 @@ class DrowsinessDetector:
             cooldown_elapsed = (self._eyes_closed_relearn_last is None or
                                now - self._eyes_closed_relearn_last >= EYES_CLOSED_RELEARN_COOLDOWN_SEC)
             if cooldown_elapsed and self.fp_threshold is not None:
-                self.fp_threshold = float(np.clip(
-                    self.fp_threshold - EYES_CLOSED_RELEARN_STEP, 0.0, 0.95))
+                self._eyes_closed_relief += EYES_CLOSED_RELEARN_STEP
                 self._eyes_closed_relearn_last = now
+                self._recompute_fp_threshold()
                 print(f"[learning] eyes closed {feats['closed_duration_s']:.1f}s - "
                       f"session threshold floor lowered to {self.fp_threshold:.2f}")
 
