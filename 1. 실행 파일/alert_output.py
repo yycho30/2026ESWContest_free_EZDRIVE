@@ -90,6 +90,9 @@ class AlertSystem:
 
         # ----- Double-tap detection state -----
         self._last_tap_time = None      # None = no pending first tap
+        # Set by main.py to a no-arg function; called when a double tap
+        # dismisses level 1 or 2, so the drowsiness detector can learn from it.
+        self.on_double_tap_dismiss = None
         self._pending_release_timer = None
         self._release_pending = False
 
@@ -193,6 +196,14 @@ class AlertSystem:
                 self.led_green.on()
                 self._send_vibration_command(0)
                 print(f"Double tap - output muted for {DOUBLE_TAP_SUPPRESS_SEC:.0f} s.")
+                # Let the drowsiness detector know this was a false positive,
+                # so it can raise its threshold for probabilities like this
+                # one for the rest of the session (see on_false_positive).
+                if self.on_double_tap_dismiss is not None:
+                    try:
+                        self.on_double_tap_dismiss()
+                    except Exception as e:
+                        print(f"on_double_tap_dismiss callback failed: {e}")
         else:
             # Too late to pair; treat this as a new first tap.
             self._last_tap_time = now
