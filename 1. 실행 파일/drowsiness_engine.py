@@ -43,8 +43,8 @@ YAWN_RECENT_SEC = 10.0    # window for "yawned recently"
 
 # ===== Decision =====
 PERSONAL_PCTL = 75        # percentile of the early-drive probability distribution used as the threshold
-TH_LO, TH_HI = 0.20, 0.85
-FALSE_POSITIVE_MARGIN = 0.07   # threshold set just above the lowest false-positive
+TH_LO, TH_HI = 0.55, 0.75
+FALSE_POSITIVE_MARGIN = 0.02   # threshold set just above the lowest false-positive
                                # probability seen this session, not exactly at it
 WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
 DEFAULT_TH = 0.65   # used only before the personal threshold is learned (first WARMUP_SEC).
@@ -320,7 +320,7 @@ STATE2_STALENESS_SEC = 2.5   # a double tap this long after state 2 last held is
 
 EYES_CLOSED_RELEARN_SEC = 1.5   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
-EYES_CLOSED_RELEARN_STEP = 0.03 # how much fp_threshold drops each time that happens
+EYES_CLOSED_RELEARN_STEP = 0.01 # how much fp_threshold drops each time that happens
 EYES_CLOSED_RELEARN_COOLDOWN_SEC = 5.0  # minimum gap between two of these adjustments
 
 
@@ -430,8 +430,12 @@ class DrowsinessDetector:
             ratio = float(np.clip(ratio, 0.5, 2.0))   # don't let one odd sample overcorrect
             rescaled.append(float(np.clip(prob * ratio, 0.0, 1.0)))
         floor = min(rescaled)
-        base = float(np.clip(floor + FALSE_POSITIVE_MARGIN, 0.0, 0.95))
-        self.fp_threshold = float(np.clip(base - self._eyes_closed_relief, 0.0, 0.95))
+        # Both the raw floor and the final result stay inside TH_LO/TH_HI -
+        # the same safe range self.threshold is clamped to - so double-tap
+        # learning and eyes-closed relief can never push the effective
+        # threshold outside the range performance was tuned against.
+        base = float(np.clip(floor + FALSE_POSITIVE_MARGIN, TH_LO, TH_HI))
+        self.fp_threshold = float(np.clip(base - self._eyes_closed_relief, TH_LO, TH_HI))
 
     def update(self, ir, yaw, pitch, yaw_vel, pitch_vel,
                is_yawning, mouth_open_duration, now=None):
