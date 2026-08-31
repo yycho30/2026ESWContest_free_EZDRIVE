@@ -54,6 +54,22 @@ IR_UNRELIABLE_SEC = 5.0   # unreliable once the condition below holds this long
 IR_STUCK_STD = 3.0        # rolling std below this
 IR_STUCK_LEVEL = 0.5      # and the normalised value stuck below this
 
+# ===== Head-motion dead zone =====
+# Loosens drowsiness detection based on head movement: small posture shifts
+# (checking a mirror, adjusting position) are normal driving, not a
+# drowsiness sign, so they are pulled to 0 before reaching the model.
+# Only the excess past the zone is kept, scaled so there's no hard jump.
+HEAD_ANGLE_DEADZONE_DEG = 8.0      # pitch/yaw offset from calibrated centre
+HEAD_MOTION_DEADZONE_DEG_S = 25.0  # combined yaw+pitch angular velocity
+
+
+def _dead_zone(value, zone):
+    """Shrinks |value| < zone to 0; values beyond it continue smoothly
+    from 0 (e.g. value=zone+1 behaves like value=1 past the edge)."""
+    if value >= 0:
+        return max(value - zone, 0.0)
+    return min(value + zone, 0.0)
+
 
 @dataclass
 class CalibrationRef:
@@ -188,12 +204,20 @@ class FeatureBuffer:
             self.buf.append((now, float(ir), ir_norm))
         self._trim(self.buf, now, ROLL_SEC)
 
-        ang_mag = float(np.hypot(yaw_vel or 0.0, pitch_vel or 0.0))
+        # Dead zone: small posture shifts (a few degrees, a brief glance) are
+        # normal driving behaviour, not a drowsiness signal. Values inside
+        # the zone are pulled to 0 so they don't nudge the RF probability;
+        # only movement past the zone still counts, scaled continuously so
+        # there's no hard jump at the edge.
+        raw_ang_mag = float(np.hypot(yaw_vel or 0.0, pitch_vel or 0.0))
+        ang_mag = _dead_zone(raw_ang_mag, HEAD_MOTION_DEADZONE_DEG_S)
         self.ang_buf.append((now, ang_mag))
         self._trim(self.ang_buf, now, ROLL_SEC)
 
-        pitch_norm = (pitch - r.pitch_offset) if pitch is not None else 0.0
-        yaw_norm = (yaw - r.yaw_offset) if yaw is not None else 0.0
+        raw_pitch_norm = (pitch - r.pitch_offset) if pitch is not None else 0.0
+        raw_yaw_norm = (yaw - r.yaw_offset) if yaw is not None else 0.0
+        pitch_norm = _dead_zone(raw_pitch_norm, HEAD_ANGLE_DEADZONE_DEG)
+        yaw_norm = _dead_zone(raw_yaw_norm, HEAD_ANGLE_DEADZONE_DEG)
         self.pitch_buf.append((now, pitch_norm))
         self._trim(self.pitch_buf, now, ROLL_SEC)
 
