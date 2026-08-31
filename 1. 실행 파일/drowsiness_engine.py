@@ -321,7 +321,7 @@ STATE2_STALENESS_SEC = 2.5   # a double tap this long after state 2 last held is
                               # normal double tap gets marked stale before it
                               # even reaches here.
 
-EYES_CLOSED_RELEARN_SEC = 1.0   # eyes-closed duration that counts as real evidence
+EYES_CLOSED_RELEARN_SEC = 1.3   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
 EYES_CLOSED_RELEARN_STEP = 0.01 # how much fp_threshold drops each time that happens
 EYES_CLOSED_RELEARN_COOLDOWN_SEC = 10.0  # minimum gap between two of these adjustments
@@ -353,31 +353,24 @@ class DrowsinessDetector:
         self.ir_reliable = True
 
         # ----- Learning from double-tap dismissals (this session only) -----
-        # Each double tap on level 1/2 means the driver judged that moment
-        # a false alarm. We remember the probability at that moment and
-        # raise the effective threshold to just above it, so a similar
-        # probability doesn't fire again this session. Reset on recalibration
-        # (a new DrowsinessDetector is created), never carried across sessions.
+        # A single number, self.fp_threshold, is nudged up by double taps and
+        # down by sustained eyes-closed evidence. Reset on recalibration (a
+        # new DrowsinessDetector is created), never carried across sessions.
         #
-        # open_ref keeps drifting (see FeatureBuffer's adaptive open_ref), and
-        # the model's probability for "the same real eye state" drifts along
-        # with it. So each stored false positive also remembers the o_cur at
-        # that moment; register_false_positive() rescales it by how much
-        # o_cur has moved since, instead of comparing raw probabilities
-        # across a shifted reference. This is an approximation - the true
-        # relationship between o_cur and prob is nonlinear - but it's the
-        # right direction and keeps the learned floor from going stale.
+        # Both directions are rate-limited by their own "last adjustment"
+        # timestamp, checked independently, so a rapid double tap can't be
+        # immediately cancelled by eyes-closed relief and vice versa:
+        #   - a double tap sets _last_up_time, which blocks eyes-closed
+        #     relief for EYES_CLOSED_RELEARN_COOLDOWN_SEC afterwards
+        #   - eyes-closed relief only ever fires once every
+        #     EYES_CLOSED_RELEARN_COOLDOWN_SEC itself
         self._last_prob = None
-        self._last_o_cur = None
         self._state2_since = None
         self._state2_duration = 0.0
         self._state2_last_active = None   # time state 2 was last true, for staleness check
-        self._eyes_closed_relearn_last = None    # time of the last adjustment, for the cooldown
-        self._eyes_closed_relief = 0.0   # cumulative downward adjustment from eyes-closed
-                                          # evidence, applied on top of the recomputed floor
-                                          # so it survives _recompute_fp_threshold() every frame
-        self.false_positive_probs = []   # list of (prob, o_cur) at dismissal time
-        self.fp_threshold = None   # None until the first dismissal
+        self._last_up_time = None         # last time a double tap raised the threshold
+        self._last_down_time = None       # last time eyes-closed evidence lowered it
+        self.fp_threshold = None   # None until the first adjustment
 
     def register_false_positive(self):
         """
@@ -396,49 +389,24 @@ class DrowsinessDetector:
         # just after state 2 already ended could still see a stale >1s
         # value and wrongly count as a real dismissal. Require state 2 to
         # have been active within the last update cycle.
+        now = time.time()
         stale = (self._state2_last_active is None or
-                time.time() - self._state2_last_active > STATE2_STALENESS_SEC)
+                now - self._state2_last_active > STATE2_STALENESS_SEC)
         if stale or self._state2_duration < MIN_STATE2_DURATION_FOR_LEARNING:
             print(f"[learning] double tap ignored - state 2 only held for "
                   f"{self._state2_duration:.1f}s (need {MIN_STATE2_DURATION_FOR_LEARNING:.0f}s)"
                   + (", stale" if stale else ""))
             return
-        self.false_positive_probs.append((self._last_prob, self._last_o_cur))
-        self._recompute_fp_threshold()
+
+        base = self.fp_threshold if self.fp_threshold is not None else self.threshold
+        self.fp_threshold = float(np.clip(
+            max(base, self._last_prob) + FALSE_POSITIVE_MARGIN, TH_LO, TH_HI))
+        self._last_up_time = now
         print(f"[learning] false positive at prob={self._last_prob:.2f} "
-              f"(o_cur={self._last_o_cur:.0f}, state2 held {self._state2_duration:.1f}s) -> "
+              f"(state2 held {self._state2_duration:.1f}s) -> "
               f"session threshold floor raised to {self.fp_threshold:.2f}")
 
-    def _recompute_fp_threshold(self):
-        """Rescales every stored false-positive probability to the current
-        o_cur, floors the threshold just above the lowest of them, then
-        applies the eyes-closed relief accumulated since (see
-        register_false_positive / the eyes-closed check in update()).
-        Without the relief term this recompute would silently undo every
-        eyes-closed adjustment on the very next frame."""
-        if not self.false_positive_probs:
-            self.fp_threshold = None
-            return
-        o_now = self.fb.o_cur
-        rescaled = []
-        for prob, o_then in self.false_positive_probs:
-            if o_then and o_then > 0:
-                # o_cur moving up means the IR signal reads "more open" for
-                # the same real eye state, which the model tends to read as
-                # a lower drowsiness probability - so scale prob inversely
-                # with how much o_cur has grown since this dismissal.
-                ratio = o_then / o_now
-            else:
-                ratio = 1.0
-            ratio = float(np.clip(ratio, 0.5, 2.0))   # don't let one odd sample overcorrect
-            rescaled.append(float(np.clip(prob * ratio, 0.0, 1.0)))
-        floor = min(rescaled)
-        # Both the raw floor and the final result stay inside TH_LO/TH_HI -
-        # the same safe range self.threshold is clamped to - so double-tap
-        # learning and eyes-closed relief can never push the effective
-        # threshold outside the range performance was tuned against.
-        base = float(np.clip(floor + FALSE_POSITIVE_MARGIN, TH_LO, TH_HI))
-        self.fp_threshold = float(np.clip(base - self._eyes_closed_relief, TH_LO, TH_HI))
+
 
     def update(self, ir, yaw, pitch, yaw_vel, pitch_vel,
                is_yawning, mouth_open_duration, now=None):
@@ -455,7 +423,6 @@ class DrowsinessDetector:
                          columns=self.feature_order)
         prob = float(self.model.predict_proba(x)[0, 1])
         self._last_prob = prob                # available to register_false_positive()
-        self._last_o_cur = self.fb.o_cur       # snapshot of the adaptive reference at this moment
 
         # ---- personal threshold: treat the early drive as normal and derive
         # the threshold from that probability distribution ----
@@ -469,23 +436,14 @@ class DrowsinessDetector:
                     self.threshold = float(np.clip(th, TH_LO, TH_HI))
                 self.threshold_fixed = True
 
-        # Re-rescale the learned floor to the current o_cur every frame, so
-        # it keeps tracking open_ref's drift (e.g. glasses slipping) instead
-        # of going stale against whatever o_cur was at dismissal time.
-        if self.false_positive_probs:
-            self._recompute_fp_threshold()
-
         # A double-tap dismissal never lowers the threshold below what
         # warm-up already decided - it can only push it up further, since
         # missing real drowsiness is worse than one more false alarm.
-        # Eyes-closed relief applies on top regardless: 2s+ of real closure
-        # is direct physical evidence and lowers the threshold even before
-        # any double tap has happened.
-        effective_threshold = self.threshold
-        if self.fp_threshold is not None:
-            effective_threshold = max(effective_threshold, self.fp_threshold)
-        effective_threshold = float(np.clip(
-            effective_threshold - self._eyes_closed_relief, TH_LO, TH_HI))
+        # fp_threshold, once set, is the live effective threshold: double
+        # taps raise it, sustained eyes-closed evidence lowers it, both
+        # clamped to TH_LO/TH_HI. Before the first adjustment it stays at
+        # self.threshold (the warm-up value).
+        effective_threshold = self.fp_threshold if self.fp_threshold is not None else self.threshold
 
         danger = prob >= effective_threshold
 
@@ -524,24 +482,25 @@ class DrowsinessDetector:
             self._state2_duration = 0.0
 
         # If the eyes are closed this long, that's direct physical evidence
-        # of drowsiness regardless of what the model's probability says.
-        # This applies even before any double tap - effective_threshold
-        # subtracts _eyes_closed_relief directly - so a driver who never
-        # dismisses a false alarm still benefits from it. Rate-limited to
-        # once per EYES_CLOSED_RELEARN_COOLDOWN_SEC so it can't cascade into
-        # repeated drops during one long closure or a string of short ones.
+        # of drowsiness regardless of what the model's probability says, and
+        # applies even before any double tap has happened. Two independent
+        # guards keep this from cascading or fighting a recent double tap:
+        #   - own cooldown: fires at most once per EYES_CLOSED_RELEARN_COOLDOWN_SEC
+        #   - protects a double tap: skipped entirely if a double tap raised
+        #     the threshold within the last EYES_CLOSED_RELEARN_COOLDOWN_SEC,
+        #     so relief can't immediately cancel out what the driver just did
         if feats["closed_duration_s"] >= EYES_CLOSED_RELEARN_SEC:
-            cooldown_elapsed = (self._eyes_closed_relearn_last is None or
-                               now - self._eyes_closed_relearn_last >= EYES_CLOSED_RELEARN_COOLDOWN_SEC)
-            if cooldown_elapsed:
-                self._eyes_closed_relief += EYES_CLOSED_RELEARN_STEP
-                self._eyes_closed_relearn_last = now
-                if self.fp_threshold is not None:
-                    self._recompute_fp_threshold()
-                base = max(self.threshold, self.fp_threshold or 0.0)
-                shown = float(np.clip(base - self._eyes_closed_relief, TH_LO, TH_HI))
+            own_cooldown_elapsed = (self._last_down_time is None or
+                                    now - self._last_down_time >= EYES_CLOSED_RELEARN_COOLDOWN_SEC)
+            protects_recent_tap = (self._last_up_time is not None and
+                                   now - self._last_up_time < EYES_CLOSED_RELEARN_COOLDOWN_SEC)
+            if own_cooldown_elapsed and not protects_recent_tap:
+                base = self.fp_threshold if self.fp_threshold is not None else self.threshold
+                self.fp_threshold = float(np.clip(
+                    base - EYES_CLOSED_RELEARN_STEP, TH_LO, TH_HI))
+                self._last_down_time = now
                 print(f"[learning] eyes closed {feats['closed_duration_s']:.1f}s - "
-                      f"session threshold floor lowered to {shown:.2f}")
+                      f"session threshold floor lowered to {self.fp_threshold:.2f}")
 
         info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
