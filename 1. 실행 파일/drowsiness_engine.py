@@ -1,14 +1,15 @@
 """
-EZdrive 졸음 판단 엔진 (라즈베리파이 실시간 추론)
+EZdrive drowsiness detection engine (real-time inference on the Raspberry Pi).
 
-구성
-  CalibrationCollector : 10초 캘리브레이션(3초 뜸 / 3초 감음 / 4초 깜빡임)에서 개인 기준값 추출
-  FeatureBuffer        : 롤링 윈도우로 학습 때와 동일한 피처 생성
-  DrowsinessDetector   : RF 추론 + 개인 임계값 보정 + 상태(0/2/3) 산출
+Components
+  CalibrationCollector : extracts personal references from a 10 s calibration
+                         (3 s eyes open / 3 s eyes closed / 4 s blinking)
+  FeatureBuffer        : builds the same rolling-window features used in training
+  DrowsinessDetector   : RF inference + personal threshold + state (0/2/3)
 
-사용 흐름
-  1) 캘리브레이션: CalibrationCollector.feed()를 10초간 호출 -> finish()로 CalibrationRef 획득
-  2) 주행 중: DrowsinessDetector.update()를 매 프레임 호출 -> (state, ir_reliable) 반환
+Usage
+  1) Calibration: call CalibrationCollector.feed() for 10 s, then finish() for a CalibrationRef
+  2) Driving: call DrowsinessDetector.update() every frame -> (state, ir_reliable)
 """
 
 import json
@@ -20,38 +21,37 @@ import numpy as np
 import pandas as pd
 import joblib
 
-# ===== 캘리브레이션 구간 (초) =====
-PHASE_OPEN_END = 3.0      # 0~3초: 정면 응시(눈 뜬 상태)
-PHASE_CLOSED_END = 6.0    # 3~6초: 눈 감고 유지
-PHASE_BLINK_END = 10.0    # 6~10초: 감았다 뜨기 반복
+# ===== Calibration phases (seconds) =====
+PHASE_OPEN_END = 3.0      # 0-3 s: look straight ahead, eyes open
+PHASE_CLOSED_END = 6.0    # 3-6 s: eyes closed
+PHASE_BLINK_END = 10.0    # 6-10 s: repeated blinks
 
-CALIB_MIN_GAP = 30.0      # open_ref - closed_ref 가 이보다 작으면 캘리브레이션 실패
+CALIB_MIN_GAP = 30.0      # calibration fails if open_ref - closed_ref is smaller than this
 
-# ===== 적응형 open_ref =====
-ADAPT_GATE = 0.4          # 캘리브 기준 정규화값이 이 값 초과면 '눈 뜬 상태'로 보고 갱신 후보에 포함
-ADAPT_WINDOW = 90.0       # 갱신 후보 유지 시간(초)
-ADAPT_PCTL = 40           # 후보값의 이 퍼센타일로 갱신
-ADAPT_ALPHA = 0.03        # 지수평활 계수
-ADAPT_LO, ADAPT_HI = 0.5, 2.0   # 캘리브 open_ref 대비 허용 배율
-ADAPT_MIN_N = 50          # 후보가 이만큼 쌓여야 갱신 시작
+# ===== Adaptive open_ref =====
+ADAPT_GATE = 0.4          # frames above this (fixed-calibration scale) count as "eyes open"
+ADAPT_WINDOW = 90.0       # seconds of candidates kept
+ADAPT_PCTL = 40           # percentile of the candidates used for the update
+ADAPT_ALPHA = 0.03        # exponential smoothing factor
+ADAPT_LO, ADAPT_HI = 0.5, 2.0   # clamp, relative to the calibrated open_ref
+ADAPT_MIN_N = 50          # candidates needed before adapting starts
 
-# ===== 피처 윈도우 =====
-ROLL_SEC = 3.0            # 롤링 윈도우 길이(초)
-CLOSED_THRESHOLD = 0.3    # ir_norm 이 값 미만이면 '눈 감김'
-YAWN_RECENT_SEC = 10.0    # 최근 하품 판정 구간
+# ===== Feature windows =====
+ROLL_SEC = 3.0            # rolling window length (seconds)
+CLOSED_THRESHOLD = 0.3    # ir_norm below this counts as "eyes closed"
+YAWN_RECENT_SEC = 10.0    # window for "yawned recently"
 
-# ===== 판정 =====
-PERSONAL_PCTL = 75        # 주행 초반 정상구간 확률의 이 퍼센타일을 임계값으로
-PERSONAL_MARGIN = 0.0
+# ===== Decision =====
+PERSONAL_PCTL = 75        # percentile of the early-drive probability distribution used as the threshold
 TH_LO, TH_HI = 0.20, 0.85
-WARMUP_SEC = 60.0         # 이 시간 동안 개인 임계값 수집(그 전에는 기본 임계값 사용)
+WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
 DEFAULT_TH = 0.5
-SLEEP_DURATION_SEC = 3.0  # 눈감김이 이 시간 이상이면 state 3(수면), 미만이면 2(졸음)
+SLEEP_DURATION_SEC = 3.0  # eyes closed at least this long -> state 3 (asleep), otherwise state 2 (drowsy)
 
-# ===== IR 신뢰도 =====
-IR_UNRELIABLE_SEC = 5.0   # 아래 조건이 이 시간 이상 지속되면 신뢰 불가
-IR_STUCK_STD = 3.0        # 롤링 표준편차가 이보다 작고
-IR_STUCK_LEVEL = 0.5      # 정규화값이 이보다 낮은 상태로 계속 머무름
+# ===== IR reliability =====
+IR_UNRELIABLE_SEC = 5.0   # unreliable once the condition below holds this long
+IR_STUCK_STD = 3.0        # rolling std below this
+IR_STUCK_LEVEL = 0.5      # and the normalised value stuck below this
 
 
 @dataclass
@@ -72,7 +72,7 @@ class CalibrationRef:
 
 
 class CalibrationCollector:
-    """10초 캘리브레이션 데이터를 모아 개인 기준값을 만든다."""
+    """Collects the 10 s calibration and produces the personal references."""
 
     def __init__(self):
         self.t0 = None
@@ -80,8 +80,8 @@ class CalibrationCollector:
         self.samples = []   # (elapsed, ir, yaw, pitch)
 
     def feed(self, ir, yaw, pitch, now=None):
-        """매 프레임 호출. 반환값은 현재 안내 문구(음성/화면 표시용)."""
-        # now=0.0 도 유효한 값이므로 `or` 대신 None 검사를 쓴다
+        """Call every frame. Returns the current guidance text (for display/voice)."""
+        # now=0.0 is a valid value too, so check for None instead of using `or`
         now = time.time() if now is None else now
         if self.t0 is None:
             self.t0 = now
@@ -94,16 +94,17 @@ class CalibrationCollector:
                                  pitch if pitch is not None else np.nan))
 
         if el < PHASE_OPEN_END:
-            return "정면을 보세요"
+            return "Look straight ahead"
         if el < PHASE_CLOSED_END:
-            return "눈을 감으세요"
+            return "Close your eyes"
         if el < PHASE_BLINK_END:
-            return "눈을 감았다 뜨기를 반복하세요"
-        return "완료"
+            return "Blink (close and open) repeatedly"
+        return "Done"
 
     @property
     def elapsed(self):
-        """마지막으로 feed된 시각 기준 경과시간 (CSV 재생 시에도 올바르게 동작)."""
+        """Time since the first feed, based on the last feed's timestamp
+        (so this also behaves correctly when replaying a CSV)."""
         if self.t0 is None or self.last_t is None:
             return 0.0
         return self.last_t - self.t0
@@ -112,7 +113,7 @@ class CalibrationCollector:
         return self.elapsed >= PHASE_BLINK_END
 
     def finish(self):
-        """기준값 산출 + 품질 검증. 실패 시 valid=False."""
+        """Compute the references and run the quality check. valid=False on failure."""
         if not self.samples:
             return CalibrationRef(0, 0, 0, 0, 1, valid=False)
 
@@ -126,7 +127,8 @@ class CalibrationCollector:
         if m_open.sum() < 5 or m_closed.sum() < 5:
             return CalibrationRef(0, 0, 0, 0, 1, valid=False)
 
-        # 평균이 아닌 퍼센타일: 깜빡임으로 낮아진 값이 open_ref를 끌어내리지 않게
+        # Percentiles, not means: a blink inside the "eyes open" phase would
+        # otherwise drag open_ref down.
         open_ref = float(np.percentile(ir[m_open], 75))
         closed_ref = float(np.percentile(ir[m_closed], 25))
         blink_range = (float(np.percentile(ir[m_blink], 90) - np.percentile(ir[m_blink], 10))
@@ -141,16 +143,16 @@ class CalibrationCollector:
 
 
 class FeatureBuffer:
-    """학습 때와 동일한 피처를 실시간으로 생성한다."""
+    """Generates the same features online that were used for training."""
 
     def __init__(self, ref: CalibrationRef):
         self.ref = ref
-        self.o_cur = ref.open_ref          # 적응형 open_ref
+        self.o_cur = ref.open_ref          # adaptive open_ref
         self.buf = deque()                 # (t, ir, ir_norm)
         self.adapt_t, self.adapt_v = deque(), deque()
-        self.yawn_t = deque()              # 하품 발생 시각
+        self.yawn_t = deque()              # yawn timestamps
         self.prev_ir = None
-        self.closed_run = 0.0              # 연속 눈감김 지속시간
+        self.closed_run = 0.0              # continuous eye-closure duration
         self.prev_t = None
         self.ang_buf = deque()             # (t, ang_vel_mag)
         self.pitch_buf = deque()           # (t, pitch_norm)
@@ -164,7 +166,7 @@ class FeatureBuffer:
         r = self.ref
         c = r.closed_ref
 
-        # ---- 적응형 open_ref: '확실히 눈 뜬' 프레임만 갱신 후보로 ----
+        # ---- adaptive open_ref: only frames judged "clearly eyes open" are candidates ----
         if ir is not None:
             if (ir - c) / max(r.open_ref - c, 1e-6) > ADAPT_GATE:
                 self.adapt_t.append(now)
@@ -180,7 +182,7 @@ class FeatureBuffer:
 
         ir_norm = ((ir - c) / max(self.o_cur - c, 1e-6)) if ir is not None else np.nan
 
-        # ---- 버퍼 갱신 ----
+        # ---- update buffers ----
         if ir is not None:
             self.buf.append((now, float(ir), ir_norm))
         self._trim(self.buf, now, ROLL_SEC)
@@ -199,7 +201,7 @@ class FeatureBuffer:
         while self.yawn_t and now - self.yawn_t[0] > YAWN_RECENT_SEC:
             self.yawn_t.popleft()
 
-        # ---- 연속 눈감김 지속시간 ----
+        # ---- continuous eye-closure duration ----
         dt = (now - self.prev_t) if self.prev_t is not None else 0.0
         self.prev_t = now
         if not np.isnan(ir_norm) and ir_norm < CLOSED_THRESHOLD:
@@ -207,7 +209,7 @@ class FeatureBuffer:
         else:
             self.closed_run = 0.0
 
-        # ---- 롤링 통계 ----
+        # ---- rolling statistics ----
         irs = np.array([b[1] for b in self.buf], dtype=float)
         norms = np.array([b[2] for b in self.buf], dtype=float)
         if len(irs) >= 2:
@@ -249,7 +251,7 @@ class FeatureBuffer:
 
 
 class DrowsinessDetector:
-    """RF 추론 + 개인 임계값 보정 + 상태 산출."""
+    """RF inference + personal threshold correction + state output."""
 
     def __init__(self, ref: CalibrationRef,
                  model_path="drowsiness_rf.pkl", meta_path="model_meta.json"):
@@ -267,7 +269,7 @@ class DrowsinessDetector:
 
     def update(self, ir, yaw, pitch, yaw_vel, pitch_vel,
                is_yawning, mouth_open_duration, now=None):
-        """매 프레임 호출. (state, ir_reliable, info) 반환."""
+        """Call every frame. Returns (state, ir_reliable, info)."""
         now = time.time() if now is None else now
         if self.start_t is None:
             self.start_t = now
@@ -275,37 +277,40 @@ class DrowsinessDetector:
         feats, roll_std, ir_norm = self.fb.update(
             now, ir, yaw, pitch, yaw_vel, pitch_vel, is_yawning, mouth_open_duration)
 
-        # 학습 때와 동일한 컬럼명/순서로 넘겨야 sklearn 경고가 뜨지 않는다
+        # Same column names/order as training, so sklearn doesn't warn.
         x = pd.DataFrame([[feats[k] for k in self.feature_order]],
                          columns=self.feature_order)
         prob = float(self.model.predict_proba(x)[0, 1])
 
-        # ---- 개인 임계값 보정: 주행 초반을 정상으로 보고 그 분포에서 임계값 산출 ----
+        # ---- personal threshold: treat the early drive as normal and derive
+        # the threshold from that probability distribution ----
         elapsed = now - self.start_t
         if not self.threshold_fixed:
             if elapsed < WARMUP_SEC:
                 self.warmup_probs.append(prob)
             else:
                 if len(self.warmup_probs) >= 30:
-                    th = np.percentile(self.warmup_probs, PERSONAL_PCTL) + PERSONAL_MARGIN
+                    th = np.percentile(self.warmup_probs, PERSONAL_PCTL)
                     self.threshold = float(np.clip(th, TH_LO, TH_HI))
                 self.threshold_fixed = True
 
         danger = prob >= self.threshold
 
-        # ---- IR 신뢰도: 값이 낮게 붙은 채 거의 움직이지 않으면 센서 이탈 의심 ----
+        # ---- IR reliability: a low value that barely moves suggests the
+        # sensor has drifted off the eye ----
         stuck = (roll_std < IR_STUCK_STD) and (ir_norm < IR_STUCK_LEVEL)
         if stuck:
             if self.ir_bad_since is None:
                 self.ir_bad_since = now
-            # 실제 수면도 같은 패턴이므로, 하품 등 각성 신호가 함께 있을 때만 이상으로 본다
+            # Real sleep looks the same, so only flag it as a fault when an
+            # alertness signal (e.g. a yawn) is present at the same time.
             if (now - self.ir_bad_since) >= IR_UNRELIABLE_SEC and feats["yawn_recent"]:
                 self.ir_reliable = False
         else:
             self.ir_bad_since = None
             self.ir_reliable = True
 
-        # ---- 상태 매핑: 위험이면 눈감김 지속시간으로 2/3 구분 ----
+        # ---- state mapping: if at risk, split 2/3 by eye-closure duration ----
         if not danger:
             state = 0
         elif feats["closed_duration_s"] >= SLEEP_DURATION_SEC:
