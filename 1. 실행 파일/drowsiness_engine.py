@@ -307,6 +307,11 @@ class FeatureBuffer:
         return feats, roll_std, (0.0 if np.isnan(ir_norm) else ir_norm)
 
 
+MIN_STATE2_DURATION_FOR_LEARNING = 2.0   # a double tap only teaches the detector
+                                          # if state 2 had already held this long -
+                                          # a quick flicker + tap habit shouldn't count
+
+
 class DrowsinessDetector:
     """RF inference + personal threshold correction + state output."""
 
@@ -349,18 +354,29 @@ class DrowsinessDetector:
         # right direction and keeps the learned floor from going stale.
         self._last_prob = None
         self._last_o_cur = None
+        self._state2_since = None
+        self._state2_duration = 0.0
         self.false_positive_probs = []   # list of (prob, o_cur) at dismissal time
         self.fp_threshold = None   # None until the first dismissal
 
     def register_false_positive(self):
-        """Call when the driver dismisses the current alarm as wrong
-        (double tap). Uses the probability from the most recent update()."""
+        """
+        Call when the driver dismisses the current alarm as wrong (double
+        tap). Only learns from it if state 2 had already been continuously
+        active for at least MIN_STATE2_DURATION_FOR_LEARNING seconds - a tap
+        against a state that just flickered on, or one used as a habit, is
+        not treated as evidence the detector was wrong.
+        """
         if self._last_prob is None:
+            return
+        if self._state2_duration < MIN_STATE2_DURATION_FOR_LEARNING:
+            print(f"[learning] double tap ignored - state 2 only held for "
+                  f"{self._state2_duration:.1f}s (need {MIN_STATE2_DURATION_FOR_LEARNING:.0f}s)")
             return
         self.false_positive_probs.append((self._last_prob, self._last_o_cur))
         self._recompute_fp_threshold()
         print(f"[learning] false positive at prob={self._last_prob:.2f} "
-              f"(o_cur={self._last_o_cur:.0f}) -> "
+              f"(o_cur={self._last_o_cur:.0f}, state2 held {self._state2_duration:.1f}s) -> "
               f"session threshold floor raised to {self.fp_threshold:.2f}")
 
     def _recompute_fp_threshold(self):
@@ -450,6 +466,17 @@ class DrowsinessDetector:
             state = 3
         else:
             state = 2
+
+        # Tracks how long state 2 has been continuously active, so a double
+        # tap can require it to have held for a while (see
+        # register_false_positive) instead of learning from a single flicker.
+        if state == 2:
+            if self._state2_since is None:
+                self._state2_since = now
+            self._state2_duration = now - self._state2_since
+        else:
+            self._state2_since = None
+            self._state2_duration = 0.0
 
         info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
