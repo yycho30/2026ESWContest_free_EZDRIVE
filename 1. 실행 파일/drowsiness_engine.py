@@ -44,6 +44,8 @@ YAWN_RECENT_SEC = 10.0    # window for "yawned recently"
 # ===== Decision =====
 PERSONAL_PCTL = 75        # percentile of the early-drive probability distribution used as the threshold
 TH_LO, TH_HI = 0.20, 0.85
+FALSE_POSITIVE_MARGIN = 0.05   # threshold set just above the lowest false-positive
+                               # probability seen this session, not exactly at it
 WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
 DEFAULT_TH = 0.65   # used only before the personal threshold is learned (first WARMUP_SEC).
                     # 0.5 was too sensitive - it flagged normal driving as drowsy.
@@ -69,6 +71,15 @@ def _dead_zone(value, zone):
     if value >= 0:
         return max(value - zone, 0.0)
     return min(value + zone, 0.0)
+
+
+# Reference values the fixed defaults above were tuned against (median of
+# the 10-subject calibration set). A driver whose calibration differs from
+# these gets a proportionally different dead zone / closed-eye threshold -
+# this is what actually fits the detector to this specific person.
+BLINK_RANGE_REFERENCE = 200.0
+GAP_REFERENCE = 200.0
+PERSONAL_SCALE_LO, PERSONAL_SCALE_HI = 0.5, 2.0   # clamp so one odd calibration can't run away
 
 
 @dataclass
@@ -174,6 +185,27 @@ class FeatureBuffer:
         self.ang_buf = deque()             # (t, ang_vel_mag)
         self.pitch_buf = deque()           # (t, pitch_norm)
 
+        # ----- Fit to this specific driver's calibration -----
+        # blink_range reflects how much this person's head/eye signal moves
+        # during ordinary blinking; someone with a naturally larger signal
+        # gets a wider dead zone (their baseline "noise" is bigger), someone
+        # with a smaller one gets a narrower, more sensitive zone.
+        # BLINK_RANGE_REFERENCE is the typical value the fixed defaults were
+        # tuned against, so a ratio of 1.0 reproduces the fixed behaviour.
+        scale = float(np.clip(ref.blink_range / BLINK_RANGE_REFERENCE,
+                              PERSONAL_SCALE_LO, PERSONAL_SCALE_HI))
+        self.head_angle_deadzone = HEAD_ANGLE_DEADZONE_DEG * scale
+        self.head_motion_deadzone = HEAD_MOTION_DEADZONE_DEG_S * scale
+
+        # A larger open/closed gap means a cleaner IR signal for this person,
+        # so eye-closure detection can afford to be a bit more sensitive
+        # (lower CLOSED_THRESHOLD); a small gap gets the opposite, more
+        # conservative treatment.
+        gap_ratio = float(np.clip((ref.open_ref - ref.closed_ref) / GAP_REFERENCE,
+                                  PERSONAL_SCALE_LO, PERSONAL_SCALE_HI))
+        self.closed_threshold = float(np.clip(
+            CLOSED_THRESHOLD / gap_ratio, 0.15, 0.45))
+
     def _trim(self, dq, now, span):
         while dq and now - dq[0][0] > span:
             dq.popleft()
@@ -210,14 +242,14 @@ class FeatureBuffer:
         # only movement past the zone still counts, scaled continuously so
         # there's no hard jump at the edge.
         raw_ang_mag = float(np.hypot(yaw_vel or 0.0, pitch_vel or 0.0))
-        ang_mag = _dead_zone(raw_ang_mag, HEAD_MOTION_DEADZONE_DEG_S)
+        ang_mag = _dead_zone(raw_ang_mag, self.head_motion_deadzone)
         self.ang_buf.append((now, ang_mag))
         self._trim(self.ang_buf, now, ROLL_SEC)
 
         raw_pitch_norm = (pitch - r.pitch_offset) if pitch is not None else 0.0
         raw_yaw_norm = (yaw - r.yaw_offset) if yaw is not None else 0.0
-        pitch_norm = _dead_zone(raw_pitch_norm, HEAD_ANGLE_DEADZONE_DEG)
-        yaw_norm = _dead_zone(raw_yaw_norm, HEAD_ANGLE_DEADZONE_DEG)
+        pitch_norm = _dead_zone(raw_pitch_norm, self.head_angle_deadzone)
+        yaw_norm = _dead_zone(raw_yaw_norm, self.head_angle_deadzone)
         self.pitch_buf.append((now, pitch_norm))
         self._trim(self.pitch_buf, now, ROLL_SEC)
 
@@ -229,7 +261,7 @@ class FeatureBuffer:
         # ---- continuous eye-closure duration ----
         dt = (now - self.prev_t) if self.prev_t is not None else 0.0
         self.prev_t = now
-        if not np.isnan(ir_norm) and ir_norm < CLOSED_THRESHOLD:
+        if not np.isnan(ir_norm) and ir_norm < self.closed_threshold:
             self.closed_run += dt
         else:
             self.closed_run = 0.0
@@ -255,7 +287,7 @@ class FeatureBuffer:
             "ir_norm": 0.0 if np.isnan(ir_norm) else ir_norm,
             "ir_roll_mean": float(np.nanmean(norms)) if len(norms) else 0.0,
             "ir_roll_min": float(np.nanmin(norms)) if len(norms) else 0.0,
-            "perclos": float(np.nanmean(norms < CLOSED_THRESHOLD)) if len(norms) else 0.0,
+            "perclos": float(np.nanmean(norms < self.closed_threshold)) if len(norms) else 0.0,
             "closed_duration_s": self.closed_run,
             "ir_diff_abs": ir_diff_abs,
             "ir_roll_std": roll_std,
@@ -289,8 +321,69 @@ class DrowsinessDetector:
         self.threshold = DEFAULT_TH
         self.threshold_fixed = False
 
+        # A cleaner calibration (bigger open/closed gap) means the warm-up
+        # probability distribution for this driver is more trustworthy, so
+        # the personal threshold can afford to track it more tightly (lower
+        # percentile); a noisier calibration keeps the safer, higher default.
+        gap_ratio = float(np.clip((ref.open_ref - ref.closed_ref) / GAP_REFERENCE,
+                                  PERSONAL_SCALE_LO, PERSONAL_SCALE_HI))
+        self.personal_pctl = float(np.clip(PERSONAL_PCTL / gap_ratio, 50.0, 90.0))
+
         self.ir_bad_since = None
         self.ir_reliable = True
+
+        # ----- Learning from double-tap dismissals (this session only) -----
+        # Each double tap on level 1/2 means the driver judged that moment
+        # a false alarm. We remember the probability at that moment and
+        # raise the effective threshold to just above it, so a similar
+        # probability doesn't fire again this session. Reset on recalibration
+        # (a new DrowsinessDetector is created), never carried across sessions.
+        #
+        # open_ref keeps drifting (see FeatureBuffer's adaptive open_ref), and
+        # the model's probability for "the same real eye state" drifts along
+        # with it. So each stored false positive also remembers the o_cur at
+        # that moment; register_false_positive() rescales it by how much
+        # o_cur has moved since, instead of comparing raw probabilities
+        # across a shifted reference. This is an approximation - the true
+        # relationship between o_cur and prob is nonlinear - but it's the
+        # right direction and keeps the learned floor from going stale.
+        self._last_prob = None
+        self._last_o_cur = None
+        self.false_positive_probs = []   # list of (prob, o_cur) at dismissal time
+        self.fp_threshold = None   # None until the first dismissal
+
+    def register_false_positive(self):
+        """Call when the driver dismisses the current alarm as wrong
+        (double tap). Uses the probability from the most recent update()."""
+        if self._last_prob is None:
+            return
+        self.false_positive_probs.append((self._last_prob, self._last_o_cur))
+        self._recompute_fp_threshold()
+        print(f"[learning] false positive at prob={self._last_prob:.2f} "
+              f"(o_cur={self._last_o_cur:.0f}) -> "
+              f"session threshold floor raised to {self.fp_threshold:.2f}")
+
+    def _recompute_fp_threshold(self):
+        """Rescales every stored false-positive probability to the current
+        o_cur, then floors the threshold just above the lowest of them."""
+        if not self.false_positive_probs:
+            self.fp_threshold = None
+            return
+        o_now = self.fb.o_cur
+        rescaled = []
+        for prob, o_then in self.false_positive_probs:
+            if o_then and o_then > 0:
+                # o_cur moving up means the IR signal reads "more open" for
+                # the same real eye state, which the model tends to read as
+                # a lower drowsiness probability - so scale prob inversely
+                # with how much o_cur has grown since this dismissal.
+                ratio = o_then / o_now
+            else:
+                ratio = 1.0
+            ratio = float(np.clip(ratio, 0.5, 2.0))   # don't let one odd sample overcorrect
+            rescaled.append(float(np.clip(prob * ratio, 0.0, 1.0)))
+        floor = min(rescaled)
+        self.fp_threshold = float(np.clip(floor + FALSE_POSITIVE_MARGIN, 0.0, 0.95))
 
     def update(self, ir, yaw, pitch, yaw_vel, pitch_vel,
                is_yawning, mouth_open_duration, now=None):
@@ -306,6 +399,8 @@ class DrowsinessDetector:
         x = pd.DataFrame([[feats[k] for k in self.feature_order]],
                          columns=self.feature_order)
         prob = float(self.model.predict_proba(x)[0, 1])
+        self._last_prob = prob                # available to register_false_positive()
+        self._last_o_cur = self.fb.o_cur       # snapshot of the adaptive reference at this moment
 
         # ---- personal threshold: treat the early drive as normal and derive
         # the threshold from that probability distribution ----
@@ -315,11 +410,24 @@ class DrowsinessDetector:
                 self.warmup_probs.append(prob)
             else:
                 if len(self.warmup_probs) >= 30:
-                    th = np.percentile(self.warmup_probs, PERSONAL_PCTL)
+                    th = np.percentile(self.warmup_probs, self.personal_pctl)
                     self.threshold = float(np.clip(th, TH_LO, TH_HI))
                 self.threshold_fixed = True
 
-        danger = prob >= self.threshold
+        # Re-rescale the learned floor to the current o_cur every frame, so
+        # it keeps tracking open_ref's drift (e.g. glasses slipping) instead
+        # of going stale against whatever o_cur was at dismissal time.
+        if self.false_positive_probs:
+            self._recompute_fp_threshold()
+
+        # A double-tap dismissal never lowers the threshold below what
+        # warm-up already decided - it can only push it up further, since
+        # missing real drowsiness is worse than one more false alarm.
+        effective_threshold = self.threshold
+        if self.fp_threshold is not None:
+            effective_threshold = max(effective_threshold, self.fp_threshold)
+
+        danger = prob >= effective_threshold
 
         # ---- IR reliability: a low value that barely moves suggests the
         # sensor has drifted off the eye ----
@@ -343,7 +451,8 @@ class DrowsinessDetector:
         else:
             state = 2
 
-        info = {"prob": prob, "threshold": self.threshold,
+        info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
-                "perclos": feats["perclos"], "warmup": not self.threshold_fixed}
+                "perclos": feats["perclos"], "warmup": not self.threshold_fixed,
+                "fp_adjusted": self.fp_threshold is not None}
         return state, self.ir_reliable, info
