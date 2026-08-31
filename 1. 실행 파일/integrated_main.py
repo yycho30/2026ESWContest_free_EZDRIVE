@@ -236,6 +236,12 @@ def draw_overlay(frame, mode, guide, face, ir_val,
                           (255, 255, 255)))
             lines.append((f"ir_norm {dinfo['ir_norm']:.2f}  closed {dinfo['closed_s']:.1f}s"
                           f"  perclos {dinfo['perclos']:.2f}", (255, 255, 255)))
+        else:
+            # Should only appear for the first fraction of a second after
+            # entering "running" mode, before the first drowsy_det.update()
+            # call. If this persists, drowsy_det.update() is not being
+            # reached at all - check that mode is really "running".
+            lines.append(("dinfo: waiting for first inference...", (0, 0, 255)))
         if not ir_reliable:
             lines.append(("IR UNRELIABLE", (0, 0, 255)))
 
