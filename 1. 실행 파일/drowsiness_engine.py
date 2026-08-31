@@ -45,7 +45,8 @@ YAWN_RECENT_SEC = 10.0    # window for "yawned recently"
 PERSONAL_PCTL = 75        # percentile of the early-drive probability distribution used as the threshold
 TH_LO, TH_HI = 0.20, 0.85
 WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
-DEFAULT_TH = 0.5
+DEFAULT_TH = 0.65   # used only before the personal threshold is learned (first WARMUP_SEC).
+                    # 0.5 was too sensitive - it flagged normal driving as drowsy.
 SLEEP_DURATION_SEC = 3.0  # eyes closed at least this long -> state 3 (asleep), otherwise state 2 (drowsy)
 
 # ===== IR reliability =====
