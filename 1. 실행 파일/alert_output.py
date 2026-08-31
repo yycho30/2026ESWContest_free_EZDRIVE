@@ -102,6 +102,10 @@ class AlertSystem:
         self.fsr2.when_released = self._on_fsr_released
 
         # ----- BLE serial connection to master HM-10 (bridges to Pro Mini) -----
+        # Shared with SharedBLELink (see shared_ble_link.py): the same wire
+        # carries IR readings in and vibration commands out, so both sides
+        # take this lock before touching self.ble_serial.
+        self.ble_serial_lock = threading.Lock()
         self.ble_serial = None
         try:
             self.ble_serial = serial.Serial(BLE_SERIAL_PORT, BLE_BAUD_RATE, timeout=1)
@@ -242,11 +246,14 @@ class AlertSystem:
 
     # ---------- BLE vibration command to Pro Mini ----------
     def _send_vibration_command(self, state):
-        """Send '0'/'1'/'2'/'3' to the Pro Mini via the master HM-10 (GPIO UART)."""
+        """Send '0'/'1'/'2'/'3' to the Pro Mini via the master HM-10 (GPIO UART).
+        Takes ble_serial_lock so this never interleaves with SharedBLELink's
+        background reads of incoming IR lines on the same wire."""
         if self.ble_serial is None or state == self._last_sent_state:
             return
         try:
-            self.ble_serial.write(str(state).encode())
+            with self.ble_serial_lock:
+                self.ble_serial.write(str(state).encode())
             self._last_sent_state = state
         except serial.SerialException as e:
             print(f"BLE send failed: {e}")
