@@ -44,7 +44,7 @@ YAWN_RECENT_SEC = 10.0    # window for "yawned recently"
 # ===== Decision =====
 PERSONAL_PCTL = 75        # percentile of the early-drive probability distribution used as the threshold
 TH_LO, TH_HI = 0.20, 0.85
-FALSE_POSITIVE_MARGIN = 0.05   # threshold set just above the lowest false-positive
+FALSE_POSITIVE_MARGIN = 0.07   # threshold set just above the lowest false-positive
                                # probability seen this session, not exactly at it
 WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
 DEFAULT_TH = 0.65   # used only before the personal threshold is learned (first WARMUP_SEC).
@@ -311,6 +311,11 @@ MIN_STATE2_DURATION_FOR_LEARNING = 1.0   # a double tap only teaches the detecto
                                           # if state 2 had already held this long -
                                           # a quick flicker + tap habit shouldn't count
 
+EYES_CLOSED_RELEARN_SEC = 2.0   # eyes-closed duration that counts as real evidence
+                                 # of drowsiness, overriding a earlier double-tap dismissal
+EYES_CLOSED_RELEARN_STEP = 0.03 # how much fp_threshold drops each time that happens
+EYES_CLOSED_RELEARN_COOLDOWN_SEC = 10.0  # minimum gap between two of these adjustments
+
 
 class DrowsinessDetector:
     """RF inference + personal threshold correction + state output."""
@@ -356,6 +361,7 @@ class DrowsinessDetector:
         self._last_o_cur = None
         self._state2_since = None
         self._state2_duration = 0.0
+        self._eyes_closed_relearn_last = None    # time of the last adjustment, for the cooldown
         self.false_positive_probs = []   # list of (prob, o_cur) at dismissal time
         self.fp_threshold = None   # None until the first dismissal
 
@@ -477,6 +483,22 @@ class DrowsinessDetector:
         else:
             self._state2_since = None
             self._state2_duration = 0.0
+
+        # If the eyes are closed this long, that's direct physical evidence
+        # of drowsiness regardless of what the model's probability says -
+        # including when a double-tap dismissal raised fp_threshold and is
+        # now suppressing a real detection. Rate-limited to once per
+        # EYES_CLOSED_RELEARN_COOLDOWN_SEC so it can't cascade into repeated
+        # drops during one long closure or a string of short ones.
+        if feats["closed_duration_s"] >= EYES_CLOSED_RELEARN_SEC:
+            cooldown_elapsed = (self._eyes_closed_relearn_last is None or
+                               now - self._eyes_closed_relearn_last >= EYES_CLOSED_RELEARN_COOLDOWN_SEC)
+            if cooldown_elapsed and self.fp_threshold is not None:
+                self.fp_threshold = float(np.clip(
+                    self.fp_threshold - EYES_CLOSED_RELEARN_STEP, 0.0, 0.95))
+                self._eyes_closed_relearn_last = now
+                print(f"[learning] eyes closed {feats['closed_duration_s']:.1f}s - "
+                      f"session threshold floor lowered to {self.fp_threshold:.2f}")
 
         info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
