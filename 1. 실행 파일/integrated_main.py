@@ -41,13 +41,13 @@ from picamera2 import Picamera2
 
 from face_monitor import (
     MODEL_PATH, MAR_THRESHOLD, YAWN_HOLD_TIME,
-    SERIAL_PORT, BAUD_RATE,
-    IRReader, calc_mar, estimate_head_pose,
+    calc_mar, estimate_head_pose,
 )
 from drowsiness_engine import CalibrationCollector, DrowsinessDetector
 import inattention_engine as ie
 from inattention_engine import InattentionDetector
 from alert_output import AlertSystem
+from shared_ble_link import SharedBLELink
 
 # ===== Internal camera =====
 INNER_CAM_INDEX = 9
@@ -243,8 +243,11 @@ def main():
         picam2.stop()
         return
 
-    ir_reader = IRReader(SERIAL_PORT, BAUD_RATE)
+    # AlertSystem opens the one and only serial connection to the master
+    # HM-10 (/dev/serial0). It must be created before SharedBLELink, which
+    # reads incoming IR lines on that same connection.
     alert = AlertSystem()
+    ble_link = SharedBLELink(alert)
 
     mode = "waiting"            # waiting -> calibrating -> running
     collector = None
@@ -269,7 +272,7 @@ def main():
             now = time.time()
             ext_frame = picam2.capture_array()
             face, _inner_frame = face_tracker.process(now)
-            ir_val = parse_ir(ir_reader.get_latest())
+            ir_val = parse_ir(ble_link.get_latest_ir())
 
             # ---- power button starts (or restarts) calibration ----
             if alert.consume_calibration_request():
@@ -372,7 +375,7 @@ def main():
     finally:
         picam2.stop()
         face_tracker.close()
-        ir_reader.stop()
+        ble_link.stop()
         alert.cleanup()
         if SHOW_PREVIEW:
             cv2.destroyAllWindows()
