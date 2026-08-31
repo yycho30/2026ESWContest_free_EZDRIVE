@@ -310,8 +310,13 @@ class FeatureBuffer:
 MIN_STATE2_DURATION_FOR_LEARNING = 1.0   # a double tap only teaches the detector
                                           # if state 2 had already held this long -
                                           # a quick flicker + tap habit shouldn't count
-STATE2_STALENESS_SEC = 0.5   # a double tap this long after state 2 last held is
-                              # treated as unrelated, not a dismissal of it
+STATE2_STALENESS_SEC = 2.5   # a double tap this long after state 2 last held is
+                              # treated as unrelated, not a dismissal of it.
+                              # Must comfortably exceed the button pipeline's own
+                              # delay (SIMULTANEOUS_RELEASE_GRACE + DOUBLE_TAP_WINDOW
+                              # in alert_output.py, up to ~1.3s) or a completely
+                              # normal double tap gets marked stale before it
+                              # even reaches here.
 
 EYES_CLOSED_RELEARN_SEC = 1.5   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
