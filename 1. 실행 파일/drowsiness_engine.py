@@ -307,7 +307,7 @@ class FeatureBuffer:
         return feats, roll_std, (0.0 if np.isnan(ir_norm) else ir_norm)
 
 
-MIN_STATE2_DURATION_FOR_LEARNING = 2.0   # a double tap only teaches the detector
+MIN_STATE2_DURATION_FOR_LEARNING = 1.0   # a double tap only teaches the detector
                                           # if state 2 had already held this long -
                                           # a quick flicker + tap habit shouldn't count
 
