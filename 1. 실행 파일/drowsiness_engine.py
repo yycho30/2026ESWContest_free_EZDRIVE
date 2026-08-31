@@ -311,10 +311,10 @@ MIN_STATE2_DURATION_FOR_LEARNING = 1.0   # a double tap only teaches the detecto
                                           # if state 2 had already held this long -
                                           # a quick flicker + tap habit shouldn't count
 
-EYES_CLOSED_RELEARN_SEC = 2.0   # eyes-closed duration that counts as real evidence
+EYES_CLOSED_RELEARN_SEC = 1.5   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
 EYES_CLOSED_RELEARN_STEP = 0.03 # how much fp_threshold drops each time that happens
-EYES_CLOSED_RELEARN_COOLDOWN_SEC = 10.0  # minimum gap between two of these adjustments
+EYES_CLOSED_RELEARN_COOLDOWN_SEC = 5.0  # minimum gap between two of these adjustments
 
 
 class DrowsinessDetector:
