@@ -318,6 +318,7 @@ def main():
                 collector = CalibrationCollector()
                 drowsy_det = None
                 inatt_det = None
+                alert.on_double_tap_dismiss = None   # stale reference to the old detector
                 mode = "calibrating"
                 alert.begin_calibration()
                 print("Calibration started. Follow the on-screen guide.")
@@ -335,6 +336,11 @@ def main():
                         ref.save()
                         drowsy_det = DrowsinessDetector(ref)
                         inatt_det = InattentionDetector()
+                        # A double tap that dismisses level 1/2 means the
+                        # driver judged that moment a false alarm; feed it
+                        # back so the detector raises its threshold for
+                        # similar probabilities for the rest of this session.
+                        alert.on_double_tap_dismiss = drowsy_det.register_false_positive
                         # The neutral head angle measured during calibration also
                         # becomes the zero point for the forward-attention check.
                         ie.HEAD_YAW_OFFSET_DEG = ref.yaw_offset
