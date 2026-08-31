@@ -50,7 +50,29 @@ from alert_output import AlertSystem
 from shared_ble_link import SharedBLELink
 
 # ===== Internal camera =====
-INNER_CAM_INDEX = 9
+# Fixed /dev/videoN indices are not reliable on this Pi: USB re-enumeration
+# after a reboot or cable reconnect can swap which index the internal USB
+# webcam gets (seen both at 8/9 and at 0/1). Finding it by device name is
+# stable across reboots; only fall back to a fixed index if that fails.
+INNER_CAM_NAME = "Innomaker-U20CAM"
+INNER_CAM_INDEX_FALLBACK = 0
+
+
+def find_camera_index_by_name(name_substr, max_index=40):
+    """Scan /sys/class/video4linux for a capture device whose name matches,
+    and return its index, or None if not found."""
+    import glob
+    for path in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+        try:
+            with open(path) as f:
+                dev_name = f.read().strip()
+        except OSError:
+            continue
+        if name_substr.lower() in dev_name.lower():
+            idx = int(path.split("video4linux/video")[1].split("/")[0])
+            if idx <= max_index:
+                return idx
+    return None
 INNER_CAM_WIDTH = 320       # low resolution keeps MediaPipe fast
 INNER_CAM_HEIGHT = 240
 HEAD_YAW_SKIP = 1           # run MediaPipe every (SKIP+1)-th frame, reuse last result
@@ -79,7 +101,7 @@ def parse_ir(raw):
 class FaceTracker:
     """Head pose, angular velocity and yawning from the internal camera."""
 
-    def __init__(self, cam_index=INNER_CAM_INDEX):
+    def __init__(self, cam_index=None):
         base = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
         self.landmarker = vision.FaceLandmarker.create_from_options(
             vision.FaceLandmarkerOptions(
@@ -88,6 +110,17 @@ class FaceTracker:
                 num_faces=1,
             )
         )
+
+        if cam_index is None:
+            cam_index = find_camera_index_by_name(INNER_CAM_NAME)
+            if cam_index is None:
+                print(f"Could not find a camera named '{INNER_CAM_NAME}', "
+                      f"falling back to index {INNER_CAM_INDEX_FALLBACK}. "
+                      f"Run 'v4l2-ctl --list-devices' to check.")
+                cam_index = INNER_CAM_INDEX_FALLBACK
+            else:
+                print(f"Internal camera '{INNER_CAM_NAME}' found at /dev/video{cam_index}")
+
         self.cap = cv2.VideoCapture(cam_index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, INNER_CAM_WIDTH)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, INNER_CAM_HEIGHT)
