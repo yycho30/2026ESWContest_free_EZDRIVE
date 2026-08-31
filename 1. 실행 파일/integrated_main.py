@@ -50,7 +50,7 @@ from inattention_engine import InattentionDetector
 from alert_output import AlertSystem
 
 # ===== Internal camera =====
-INNER_CAM_INDEX = 0
+INNER_CAM_INDEX = 8
 INNER_CAM_WIDTH = 320       # low resolution keeps MediaPipe fast
 INNER_CAM_HEIGHT = 240
 HEAD_YAW_SKIP = 1           # run MediaPipe every (SKIP+1)-th frame, reuse last result
