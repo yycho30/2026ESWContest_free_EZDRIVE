@@ -321,10 +321,10 @@ STATE2_STALENESS_SEC = 2.5   # a double tap this long after state 2 last held is
                               # normal double tap gets marked stale before it
                               # even reaches here.
 
-EYES_CLOSED_RELEARN_SEC = 2.0   # eyes-closed duration that counts as real evidence
+EYES_CLOSED_RELEARN_SEC = 1.0   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
 EYES_CLOSED_RELEARN_STEP = 0.01 # how much fp_threshold drops each time that happens
-EYES_CLOSED_RELEARN_COOLDOWN_SEC = 5.0  # minimum gap between two of these adjustments
+EYES_CLOSED_RELEARN_COOLDOWN_SEC = 10.0  # minimum gap between two of these adjustments
 
 
 class DrowsinessDetector:
@@ -538,8 +538,10 @@ class DrowsinessDetector:
                 self._eyes_closed_relearn_last = now
                 if self.fp_threshold is not None:
                     self._recompute_fp_threshold()
+                base = max(self.threshold, self.fp_threshold or 0.0)
+                shown = float(np.clip(base - self._eyes_closed_relief, TH_LO, TH_HI))
                 print(f"[learning] eyes closed {feats['closed_duration_s']:.1f}s - "
-                      f"threshold relief now {self._eyes_closed_relief:.2f}")
+                      f"session threshold floor lowered to {shown:.2f}")
 
         info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
