@@ -47,7 +47,10 @@ TH_LO, TH_HI = 0.55, 0.75
 FALSE_POSITIVE_MARGIN = 0.02   # threshold set just above the lowest false-positive
                                # probability seen this session, not exactly at it
 WARMUP_SEC = 60.0         # personal threshold is learned over this long; the default is used before that
-DEFAULT_TH = 0.65   # used only before the personal threshold is learned (first WARMUP_SEC).
+DEFAULT_TH = TH_HI   # used only before the personal threshold is learned (first WARMUP_SEC).
+                     # Starts at the most conservative (least sensitive) end of the
+                     # allowed range, since there's no personal data yet to justify
+                     # anything more sensitive.
                     # 0.5 was too sensitive - it flagged normal driving as drowsy.
 SLEEP_DURATION_SEC = 3.0  # eyes closed at least this long -> state 3 (asleep), otherwise state 2 (drowsy)
 
@@ -318,7 +321,7 @@ STATE2_STALENESS_SEC = 2.5   # a double tap this long after state 2 last held is
                               # normal double tap gets marked stale before it
                               # even reaches here.
 
-EYES_CLOSED_RELEARN_SEC = 1.5   # eyes-closed duration that counts as real evidence
+EYES_CLOSED_RELEARN_SEC = 2.0   # eyes-closed duration that counts as real evidence
                                  # of drowsiness, overriding a earlier double-tap dismissal
 EYES_CLOSED_RELEARN_STEP = 0.01 # how much fp_threshold drops each time that happens
 EYES_CLOSED_RELEARN_COOLDOWN_SEC = 5.0  # minimum gap between two of these adjustments
@@ -475,9 +478,14 @@ class DrowsinessDetector:
         # A double-tap dismissal never lowers the threshold below what
         # warm-up already decided - it can only push it up further, since
         # missing real drowsiness is worse than one more false alarm.
+        # Eyes-closed relief applies on top regardless: 2s+ of real closure
+        # is direct physical evidence and lowers the threshold even before
+        # any double tap has happened.
         effective_threshold = self.threshold
         if self.fp_threshold is not None:
             effective_threshold = max(effective_threshold, self.fp_threshold)
+        effective_threshold = float(np.clip(
+            effective_threshold - self._eyes_closed_relief, TH_LO, TH_HI))
 
         danger = prob >= effective_threshold
 
@@ -516,20 +524,22 @@ class DrowsinessDetector:
             self._state2_duration = 0.0
 
         # If the eyes are closed this long, that's direct physical evidence
-        # of drowsiness regardless of what the model's probability says -
-        # including when a double-tap dismissal raised fp_threshold and is
-        # now suppressing a real detection. Rate-limited to once per
-        # EYES_CLOSED_RELEARN_COOLDOWN_SEC so it can't cascade into repeated
-        # drops during one long closure or a string of short ones.
+        # of drowsiness regardless of what the model's probability says.
+        # This applies even before any double tap - effective_threshold
+        # subtracts _eyes_closed_relief directly - so a driver who never
+        # dismisses a false alarm still benefits from it. Rate-limited to
+        # once per EYES_CLOSED_RELEARN_COOLDOWN_SEC so it can't cascade into
+        # repeated drops during one long closure or a string of short ones.
         if feats["closed_duration_s"] >= EYES_CLOSED_RELEARN_SEC:
             cooldown_elapsed = (self._eyes_closed_relearn_last is None or
                                now - self._eyes_closed_relearn_last >= EYES_CLOSED_RELEARN_COOLDOWN_SEC)
-            if cooldown_elapsed and self.fp_threshold is not None:
+            if cooldown_elapsed:
                 self._eyes_closed_relief += EYES_CLOSED_RELEARN_STEP
                 self._eyes_closed_relearn_last = now
-                self._recompute_fp_threshold()
+                if self.fp_threshold is not None:
+                    self._recompute_fp_threshold()
                 print(f"[learning] eyes closed {feats['closed_duration_s']:.1f}s - "
-                      f"session threshold floor lowered to {self.fp_threshold:.2f}")
+                      f"threshold relief now {self._eyes_closed_relief:.2f}")
 
         info = {"prob": prob, "threshold": effective_threshold,
                 "ir_norm": ir_norm, "closed_s": feats["closed_duration_s"],
